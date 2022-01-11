@@ -1,0 +1,279 @@
+Data Pipeline:
+
+1. Extract considered data from raw and load in postgis1:
+    extract_tw_text_data.py
+    train_set_v3 + new_0207 + new_0214: 2-2.5 hours (extract + load + tref update)
+    need to manually create indices on cp4.mf3jh_ven_tw_en_all
+
+2. Clean texts:
+    extract_sem_units.py
+    only the tweets marked with tref=false are processed.
+    train_set_v3 + new_0207 + new_0214 (1670573 to clean): ~1 min
+    uploading clean_txt_int to db: 15-20 min
+
+3. Extract Sem Units:
+    extract_sem_units.py
+    only the tweets what have not-None clean_txt are processed.
+    1670193 texts: 15-20 min
+    1666443 non-trivial sem units recs
+    uploading sem_units_int to db: 5-10 min
+    need to manually create indices on cp4.mf3jh_ven_tw_sem_units
+    create a materialized view for a specific time period:
+        create materialized view cp4.mf3jh_ven_tw_sem_units_0221  as
+        select a.tw_id, a.cls_json_str, a.nps, b.tw_datetime
+        from cp4.mf3jh_ven_tw_sem_units a inner join cp4.mf3jh_ven_tw_en_all b on a.tw_id = b.tw_id
+        where tw_datetime <= '20190221235959'
+        with data
+
+4. Extract phrases from sem units:
+    phrase_graph.py
+    extract phrases for each tw (1,666,443): 3-5 min
+    generate phrase_to_id and id_to_phrase mappings, and tw_to_phrases and tw_to_phids (3,547,696 phrases): ~15-20 sec
+
+5. Compute phrase embeds:
+    phrase_graph.py
+    3,547,696 phrase embeds (300-dim each): 20 procs ~1 hour
+
+6. Phrase clustering:
+    phrase_graph.py
+    build dataset for phrase clustering (use 'phid' in phrase_embeds_all_v0221.pickle as the order of embeds)
+    3,547,696 phrase embeds, 150 clusters: ~2 hours
+    compute cluster info (cluster centers, memberships, member_to_center sims): 1-2 min
+
+7. Embed phrases into phrase cluster space:
+    phrase_graph.py
+    embed phrases to 150-dim cluster space: 1-3 min
+    !!!WARNING!!!
+        embeding phrases to the cluster space may lead to very similar phrase embedings. avg sim can be >0.86
+        instead, we use onehot vecs to represent phrases. sum these vecs and calculate probability vecs for tweets.
+
+8. User beliefs modeling:
+    phrase_graph.py
+    for 1404, 43 recs, kl-div loss can be <0.002, takes ~1 hour for 1500 epochs.
+    seems that two dense layers without the transition matrix work pretty well and efficiently.
+
+
+9. New tweet generation:
+    new_tw.py
+    832190 new tweets, 643135 in (20181223235959, 20190221235959]
+
+
+
+Extra:
+1. User Data Table:
+    extract_tw_text_data.py
+    extract data from raw data: (v3) ~1 hour
+    output udt_tw: 1-2 min
+    groupby udt tw data by usr (1196035 usrs): 15-20 min
+    udt usr data: 30 procs, 5-10 min
+
+    create table if not exists cp4.mf3jh_udt_1404
+    (
+    	usr_id char(22) primary key,
+    	tw_cnt integer,
+    	tw_t_cnt integer,
+    	tw_r_cnt integer,
+    	tw_q_cnt integer,
+    	tw_n_cnt integer,
+        top_act_type char(1),
+    	top_act_ratio real,
+    	avg_am real,
+    	avg_pm real,
+    	avg_un real,
+        avg_pos real,
+    	avg_neg real,
+    	avg_neu real,
+    	nar_sum_vec integer array,
+    	nar_miss_ratio real,
+        tw_dt_start char(14),
+    	tw_dt_end char(14),
+    	tw_dt_dur integer,
+    	mid text,
+    	com_id text,
+    	com_member char(1)
+    );
+
+2. src-trg table:
+    create materialized view cp4.mf3jh_udt_tw_src_trg_sna_data as
+    select
+    		cp4.mf3jh_udt_tw_src_trg_data.trg_tw_id,
+    		cp4.mf3jh_udt_tw_src_trg_data.trg_usr_id,
+    		cp4.mf3jh_udt_tw_src_trg_sna_com_id.trg_usr_sna_com_id,
+    	    cp4.mf3jh_udt_tw_src_trg_data.trg_tw_type,
+    	    cp4.mf3jh_udt_tw_src_trg_data.trg_tw_datetime,
+    	    cp4.mf3jh_udt_tw_src_trg_data.trg_l_nars,
+    	    cp4.mf3jh_udt_tw_src_trg_data.trg_l_stances,
+    	    cp4.mf3jh_udt_tw_src_trg_data.trg_l_sentiments,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_tw_id,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_usr_id,
+    		cp4.mf3jh_udt_tw_src_trg_sna_com_id.src_usr_sna_com_id,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_tw_type,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_tw_datetime,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_l_nars,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_l_stances,
+    	    cp4.mf3jh_udt_tw_src_trg_data.src_l_sentiments
+    from
+    (
+    	cp4.mf3jh_udt_tw_src_trg_data
+    	inner join
+    	cp4.mf3jh_udt_tw_src_trg_sna_com_id
+    	on cp4.mf3jh_udt_tw_src_trg_data.trg_tw_id = cp4.mf3jh_udt_tw_src_trg_sna_com_id.trg_tw_id
+    )
+    with data
+
+
+
+606, 1287, 156, 605, 604, 1294, 1292
+160, 437, 153, 154, 449, 163, 447
+23, 1285, 1290, 1761
+
+
+/scratch/dm6ek/microsim-outputs-14417695
+/scratch/dm6ek/microsim-outputs-14417696
+/scratch/dm6ek/microsim-outputs-14417698
+/scratch/dm6ek/microsim-outputs-14417699
+/scratch/dm6ek/microsim-outputs-14417700
+/scratch/dm6ek/microsim-outputs-14417702
+/scratch/dm6ek/microsim-outputs-14417703
+/scratch/dm6ek/microsim-outputs-14417705
+/scratch/dm6ek/microsim-outputs-14417706
+/scratch/dm6ek/microsim-outputs-14417707
+
+/scratch/dm6ek/microsim-outputs-revised-14430705/
+/scratch/dm6ek/microsim-outputs-revised-14430793/
+/scratch/dm6ek/microsim-outputs-revised-14430795/
+/scratch/dm6ek/microsim-outputs-revised-14430796/
+/scratch/dm6ek/microsim-outputs-revised-14430797/
+/scratch/dm6ek/microsim-outputs-revised-14430799/
+/scratch/dm6ek/microsim-outputs-revised-14430801/
+/scratch/dm6ek/microsim-outputs-revised-14430802/
+/scratch/dm6ek/microsim-outputs-revised-14430803/
+/scratch/dm6ek/microsim-outputs-revised-14430805/
+
+
+
+3.1 - 3.14
+3.22 - 4.4
+
+
+============================================================
+
+
+
+
+
+
+
+
+1. Extract texts from the raw Twitter data:
+    extract_tw_text_data.py
+    12537978 recs out of 13182778 tws in 33794.46350979805 secs (~9.4 hours)
+    1069906|n
+    456710|q
+    283656|r
+    10727706|t
+
+    2427102 recs out of 2557003 tws in 26367.10204744339 secs. (2.1-2.7)
+
+2. Clean texts:
+    extract_sem_units.py
+    12495272 non-trivial texts out of 12537978 in 5456.153956651688 secs (~1.5 hours)
+
+3. Extract semantic units from the texts:
+    extract_sem_units.py
+    1767685 texts (retweets that have source tweets in the dataset are not included) in ~8.3 hours (40 threads)
+
+4. Compute semantic unit vectors:
+    Types: ['avg_nps_vect', 'avg_nps_vect_w_avg_edge_vect', 'avg_nps_vect_sp_w_avg_edge_vect']
+    12537978 tw_ids, 1767685 texts in 65236.46493434906 secs (~18 hours)
+
+5. Output semantic unit vectors:
+    12114380 embeds for avg_nps_vect all done in 7686.1458575725555 secs.
+    12114380 embeds for avg_nps_vect_sp_w_avg_edge_vect all done in 9311.572184562683 secs.
+    12114380 embeds for avg_nps_vect_w_avg_edge_vect all done in 6733.765095472336 secs.
+
+6. User average embeddings:
+    Use 'compute_usr_avg_embeds_alt_wrapper' in sem_units_embeddings.py. This will take just a couple of hours as
+    this way avoids querying tw_ids by each usr_id. Queries are always expensive.
+    Though, notice that postgis1 only supports a very limited number of parallel connections. So we have to do this
+    batch by batch on one node.
+    embed_usrs=1145649 (before add activated users)
+    num_all_usrs=1146132 (after add activated users) zero_cnt=23978
+    num_act_usrs=167677 (activated users)
+    num_usrs=1194142, zero_cnt=71988 (after make up for all users)
+
+7. Phrase clustering:
+    4216736 unique phrases. One phrase may have multiple POS's.
+    'npy' files are more efficient in space.
+    for K=200, the clustering costs ~2.5-3 hours
+    for K=50, the clustering costs ~50 mins
+
+8. Phrase extraction:
+    Loading in the whole sem unit DB costs ~1 min. It cost ~3GB in memory.
+    Extracting srg->trg tw_id pairs costs ~140 sec. This doesn't need multithreading.
+
+9. Phrase embedding to cluster space:
+    150 dim embeds cost ~15 min.
+
+
+
+
+
+TODO:
+Remake the retweet text extraction.
+Issues:
+1. We should not process the text of a tweet redundantly for its retweets. We should just process once and point all
+of its retweets to this tweet.
+2. For some tweets being retweeted, there may not be tweet objects for them in the dataset. But it is very likely to
+have texts in those retweet objects existing in the dataset. Then we should complement those retweeted ones with texts,
+and store them into the DB.
+
+TODO:
+Rethink about extracting phrases from core clause structures. There can be singleton nodes without any incident edge.
+We may consider those nodes as phrases as well.
+
+
+7073307
+553851
+
+
+
+
+Postgresql server: postgis1-s.bii.virginia.edu
+import psycopg2
+    import sshtunnel
+
+    try:
+        with sshtunnel.open_tunnel(('rivanna.hpc.virginia.edu', 22),
+                                   ssh_username='mf3jh',
+                                   ssh_password='LSRDeae19830602!',
+                                   remote_bind_address=('postgis1-s.bii.virginia.edu', 5432),
+                                   local_bind_address=('localhost', 1234)) as tunnel:
+
+            tunnel.start()
+            print("server connected")
+
+            conn = psycopg2.connect(host=tunnel.local_bind_host,
+                                    port=tunnel.local_bind_port,
+                                    dbname='socialsim',
+                                    user='mf3jh',
+                                    password='LSRDeae19830602!')
+            print("database connected")
+
+            curs = conn.cursor()
+            sql_str = '''select id, usr_id, txt from cp4.tw_ limit 5;'''
+            curs.execute(sql_str)
+            recs = curs.fetchall()
+            print(recs)
+
+            curs.close()
+            conn.close()
+            tunnel.stop()
+    except Exception as err:
+        print("Connection Failed %s" % err)
+
+
+12.24 to 1.10
+
+12.24 to 1.18
+
